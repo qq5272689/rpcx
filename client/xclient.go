@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"net/url"
 	"reflect"
 	"strings"
 	"sync"
@@ -74,6 +75,8 @@ type xClient struct {
 	Plugins PluginContainer
 
 	ch chan []*KVPair
+
+	serverMessageChan chan<- *protocol.Message
 }
 
 // NewXClient creates a XClient that supports service discovery and service governance.
@@ -92,6 +95,42 @@ func NewXClient(servicePath string, failMode FailMode, selectMode SelectMode, di
 	for _, p := range pairs {
 		servers[p.Key] = p.Value
 	}
+	filterByStateAndGroup(client.option.Group, servers)
+
+	client.servers = servers
+	if selectMode != Closest && selectMode != SelectByUser {
+		client.selector = newSelector(selectMode, servers)
+	}
+
+	client.Plugins = &pluginContainer{}
+
+	ch := client.discovery.WatchService()
+	if ch != nil {
+		client.ch = ch
+		go client.watch(ch)
+	}
+
+	return client
+}
+
+// NewBidirectionalXClient creates a new xclient that can receive notifications from servers.
+func NewBidirectionalXClient(servicePath string, failMode FailMode, selectMode SelectMode, discovery ServiceDiscovery, option Option, serverMessageChan chan<- *protocol.Message) XClient {
+	client := &xClient{
+		failMode:          failMode,
+		selectMode:        selectMode,
+		discovery:         discovery,
+		servicePath:       servicePath,
+		cachedClient:      make(map[string]RPCClient),
+		option:            option,
+		serverMessageChan: serverMessageChan,
+	}
+
+	servers := make(map[string]string)
+	pairs := discovery.GetServices()
+	for _, p := range pairs {
+		servers[p.Key] = p.Value
+	}
+	filterByStateAndGroup(client.option.Group, servers)
 	client.servers = servers
 	if selectMode != Closest && selectMode != SelectByUser {
 		client.selector = newSelector(selectMode, servers)
@@ -142,6 +181,7 @@ func (c *xClient) watch(ch chan []*KVPair) {
 			servers[p.Key] = p.Value
 		}
 		c.mu.Lock()
+		filterByStateAndGroup(c.option.Group, servers)
 		c.servers = servers
 
 		if c.selector != nil {
@@ -149,6 +189,18 @@ func (c *xClient) watch(ch chan []*KVPair) {
 		}
 
 		c.mu.Unlock()
+	}
+}
+func filterByStateAndGroup(group string, servers map[string]string) {
+	for k, v := range servers {
+		if values, err := url.ParseQuery(v); err == nil {
+			if state := values.Get("state"); state == "inactive" {
+				delete(servers, k)
+			}
+			if group != "" && group != values.Get("group") {
+				delete(servers, k)
+			}
+		}
 	}
 }
 
@@ -177,7 +229,7 @@ func (c *xClient) getCachedClient(k string) (RPCClient, error) {
 	//double check
 	c.mu.Lock()
 	client = c.cachedClient[k]
-	if client == nil {
+	if client == nil || client.IsShutdown() {
 		network, addr := splitNetworkAndAddress(k)
 		if network == "inprocess" {
 			client = InprocessClient
@@ -193,9 +245,44 @@ func (c *xClient) getCachedClient(k string) (RPCClient, error) {
 			}
 		}
 
+		client.RegisterServerMessageChan(c.serverMessageChan)
+
 		c.cachedClient[k] = client
 	}
 	c.mu.Unlock()
+
+	return client, nil
+}
+
+func (c *xClient) getCachedClientWithoutLock(k string) (RPCClient, error) {
+	client := c.cachedClient[k]
+	if client != nil {
+		if !client.IsClosing() && !client.IsShutdown() {
+			return client, nil
+		}
+	}
+
+	//double check
+	client = c.cachedClient[k]
+	if client == nil {
+		network, addr := splitNetworkAndAddress(k)
+		if network == "inprocess" {
+			client = InprocessClient
+		} else {
+			client = &Client{
+				option:  c.option,
+				Plugins: c.Plugins,
+			}
+			err := client.Connect(network, addr)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		client.RegisterServerMessageChan(c.serverMessageChan)
+
+		c.cachedClient[k] = client
+	}
 
 	return client, nil
 }
@@ -209,6 +296,7 @@ func (c *xClient) removeClient(k string, client RPCClient) {
 	c.mu.Unlock()
 
 	if client != nil {
+		client.UnregisterServerMessageChan()
 		client.Close()
 	}
 }
@@ -314,7 +402,60 @@ func (c *xClient) Call(ctx context.Context, serviceMethod string, args interface
 		}
 
 		return err
+	case Failbackup:
+		ctx, cancelFn := context.WithCancel(ctx)
+		defer cancelFn()
+		call1 := make(chan *Call, 10)
+		call2 := make(chan *Call, 10)
 
+		var reply1, reply2 interface{}
+
+		if reply != nil {
+			reply1 = reflect.New(reflect.ValueOf(reply).Elem().Type()).Interface()
+			reply2 = reflect.New(reflect.ValueOf(reply).Elem().Type()).Interface()
+		}
+
+		_, err1 := c.Go(ctx, serviceMethod, args, reply1, call1)
+
+		t := time.NewTimer(c.option.BackupLatency)
+		select {
+		case <-ctx.Done(): //cancel by context
+			err = ctx.Err()
+			return err
+		case call := <-call1:
+			err = call.Error
+			if err == nil && reply != nil {
+				reflect.ValueOf(reply).Elem().Set(reflect.ValueOf(reply1).Elem())
+			}
+			return err
+		case <-t.C:
+
+		}
+		_, err2 := c.Go(ctx, serviceMethod, args, reply2, call2)
+		if err2 != nil {
+			if _, ok := err.(ServiceError); !ok {
+				c.removeClient(k, client)
+			}
+			err = err1
+			return err
+		}
+
+		select {
+		case <-ctx.Done(): //cancel by context
+			err = ctx.Err()
+		case call := <-call1:
+			err = call.Error
+			if err == nil && reply != nil && reply1 != nil {
+				reflect.ValueOf(reply).Elem().Set(reflect.ValueOf(reply1).Elem())
+			}
+		case call := <-call2:
+			err = call.Error
+			if err == nil && reply != nil && reply2 != nil {
+				reflect.ValueOf(reply).Elem().Set(reflect.ValueOf(reply2).Elem())
+			}
+		}
+
+		return err
 	default: //Failfast
 		err = c.wrapCall(ctx, client, serviceMethod, args, reply)
 		if err != nil {
@@ -433,15 +574,15 @@ func (c *xClient) Broadcast(ctx context.Context, serviceMethod string, args inte
 		m[share.AuthKey] = c.auth
 	}
 
-	var clients []RPCClient
+	var clients = make(map[string]RPCClient)
 	c.mu.RLock()
 	for k := range c.servers {
-		client, err := c.getCachedClient(k)
+		client, err := c.getCachedClientWithoutLock(k)
 		if err != nil {
 			c.mu.RUnlock()
 			return err
 		}
-		clients = append(clients, client)
+		clients[k] = client
 	}
 	c.mu.RUnlock()
 
@@ -452,11 +593,15 @@ func (c *xClient) Broadcast(ctx context.Context, serviceMethod string, args inte
 	var err error
 	l := len(clients)
 	done := make(chan bool, l)
-	for _, client := range clients {
+	for k, client := range clients {
+		k := k
 		client := client
 		go func() {
 			err = c.wrapCall(ctx, client, serviceMethod, args, reply)
 			done <- (err == nil)
+			if err != nil {
+				c.removeClient(k, client)
+			}
 		}()
 	}
 
@@ -493,18 +638,17 @@ func (c *xClient) Fork(ctx context.Context, serviceMethod string, args interface
 		m[share.AuthKey] = c.auth
 	}
 
-	var clients []RPCClient
+	var clients = make(map[string]RPCClient)
 	c.mu.RLock()
 	for k := range c.servers {
-		client, err := c.getCachedClient(k)
+		client, err := c.getCachedClientWithoutLock(k)
 		if err != nil {
 			c.mu.RUnlock()
 			return err
 		}
-		clients = append(clients, client)
+		clients[k] = client
 	}
 	c.mu.RUnlock()
-
 	if len(clients) == 0 {
 		return ErrXClientNoServer
 	}
@@ -512,15 +656,24 @@ func (c *xClient) Fork(ctx context.Context, serviceMethod string, args interface
 	var err error
 	l := len(clients)
 	done := make(chan bool, l)
-	for _, client := range clients {
+	for k, client := range clients {
+		k := k
 		client := client
 		go func() {
-			clonedReply := reflect.New(reflect.ValueOf(reply).Elem().Type()).Interface()
-			err = c.wrapCall(ctx, client, serviceMethod, args, clonedReply)
-			done <- (err == nil)
-			if err == nil {
-				reflect.ValueOf(reply).Set(reflect.ValueOf(clonedReply))
+			var clonedReply interface{}
+			if reply != nil {
+				clonedReply = reflect.New(reflect.ValueOf(reply).Elem().Type()).Interface()
 			}
+
+			err = c.wrapCall(ctx, client, serviceMethod, args, clonedReply)
+			if err == nil && reply != nil && clonedReply != nil {
+				reflect.ValueOf(reply).Elem().Set(reflect.ValueOf(clonedReply).Elem())
+			}
+			done <- (err == nil)
+			if err != nil {
+				c.removeClient(k, client)
+			}
+
 		}()
 	}
 

@@ -50,6 +50,14 @@ func NewMDNSDiscovery(service string, timeout time.Duration, watchInterval time.
 	return d
 }
 
+// NewMDNSDiscoveryTemplate returns a new MDNSDiscovery template.
+func NewMDNSDiscoveryTemplate(timeout time.Duration, watchInterval time.Duration, domain string) ServiceDiscovery {
+	if domain == "" {
+		domain = "local."
+	}
+	return &MDNSDiscovery{Timeout: timeout, WatchInterval: watchInterval, domain: domain}
+}
+
 // Clone clones this ServiceDiscovery with new servicePath.
 func (d MDNSDiscovery) Clone(servicePath string) ServiceDiscovery {
 	return NewMDNSDiscovery(servicePath, d.Timeout, d.WatchInterval, d.domain)

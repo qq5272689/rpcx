@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/smallnest/rpcx/log"
@@ -46,6 +47,8 @@ var (
 	RemoteConnContextKey = &contextKey{"remote-conn"}
 	// StartRequestContextKey records the start time
 	StartRequestContextKey = &contextKey{"start-parse-request"}
+	// StartSendRequestContextKey records the start time
+	StartSendRequestContextKey = &contextKey{"start-send-request"}
 )
 
 // Server is rpcx server that use TCP or UDP.
@@ -60,6 +63,7 @@ type Server struct {
 	mu         sync.RWMutex
 	activeConn map[net.Conn]struct{}
 	doneChan   chan struct{}
+	seq        uint64
 
 	// inShutdown int32
 	onShutdown []func()
@@ -103,6 +107,36 @@ func (s *Server) Address() net.Addr {
 	return s.ln.Addr()
 }
 
+// SendMessage a request to the specified client.
+// The client is designated by the conn.
+// conn can be gotten from context in services:
+//
+//   ctx.Value(RemoteConnContextKey)
+//
+// servicePath, serviceMethod, metadata can be set to zero values.
+func (s *Server) SendMessage(conn net.Conn, servicePath, serviceMethod string, metadata map[string]string, data []byte) error {
+	ctx := context.WithValue(context.Background(), StartSendRequestContextKey, time.Now().UnixNano())
+	s.Plugins.DoPreWriteRequest(ctx)
+
+	req := protocol.GetPooledMsg()
+	req.SetMessageType(protocol.Request)
+
+	seq := atomic.AddUint64(&s.seq, 1)
+	req.SetSeq(seq)
+	req.SetOneway(true)
+	req.SetSerializeType(protocol.SerializeNone)
+	req.ServicePath = servicePath
+	req.ServiceMethod = serviceMethod
+	req.Metadata = metadata
+	req.Payload = data
+
+	reqData := req.Encode()
+	_, err := conn.Write(reqData)
+	s.Plugins.DoPostWriteRequest(ctx, req, err)
+	protocol.FreeMsg(req)
+	return err
+}
+
 func (s *Server) getDoneChan() <-chan struct{} {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -126,6 +160,10 @@ func (s *Server) Serve(network, address string) (err error) {
 		s.serveByHTTP(ln, "")
 		return nil
 	}
+
+	// try to start gateway
+	ln = s.startGateway(network, ln)
+
 	return s.serveListener(ln)
 }
 
@@ -276,15 +314,22 @@ func (s *Server) serveConn(conn net.Conn) {
 		ctx = context.WithValue(ctx, StartRequestContextKey, time.Now().UnixNano())
 		err = s.auth(ctx, req)
 		if err != nil {
-			s.Plugins.DoPreWriteResponse(ctx, req)
+
 			if !req.IsOneway() {
 				res := req.Clone()
 				res.SetMessageType(protocol.Response)
+				if len(res.Payload) > 1024 && req.CompressType() != protocol.None {
+					res.SetCompressType(req.CompressType())
+				}
 				handleError(res, err)
 				data := res.Encode()
+
+				s.Plugins.DoPreWriteResponse(ctx, req, res)
 				conn.Write(data)
 				s.Plugins.DoPostWriteResponse(ctx, req, res, err)
 				protocol.FreeMsg(res)
+			} else {
+				s.Plugins.DoPreWriteResponse(ctx, req, nil)
 			}
 
 			protocol.FreeMsg(req)
@@ -303,10 +348,12 @@ func (s *Server) serveConn(conn net.Conn) {
 				share.ResMetaDataKey, resMetadata)
 
 			res, err := s.handleRequest(newCtx, req)
+
 			if err != nil {
 				log.Warnf("rpcx: failed to handle request: %v", err)
 			}
-			s.Plugins.DoPreWriteResponse(newCtx, req)
+
+			s.Plugins.DoPreWriteResponse(newCtx, req, res)
 			if !req.IsOneway() {
 				if len(resMetadata) > 0 { //copy meta in context to request
 					meta := res.Metadata
@@ -319,6 +366,9 @@ func (s *Server) serveConn(conn net.Conn) {
 					}
 				}
 
+				if len(res.Payload) > 1024 && req.CompressType() != protocol.None {
+					res.SetCompressType(req.CompressType())
+				}
 				data := res.Encode()
 				conn.Write(data)
 				//res.WriteTo(conn)
@@ -332,11 +382,17 @@ func (s *Server) serveConn(conn net.Conn) {
 }
 
 func (s *Server) readRequest(ctx context.Context, r io.Reader) (req *protocol.Message, err error) {
-	s.Plugins.DoPreReadRequest(ctx)
+	err = s.Plugins.DoPreReadRequest(ctx)
+	if err != nil {
+		return nil, err
+	}
 	// pool req?
 	req = protocol.GetPooledMsg()
 	err = req.Decode(r)
-	s.Plugins.DoPostReadRequest(ctx, req, err)
+	perr := s.Plugins.DoPostReadRequest(ctx, req, err)
+	if err == nil {
+		err = perr
+	}
 	return req, err
 }
 
@@ -387,7 +443,11 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Message) (res 
 
 	replyv := argsReplyPools.Get(mtype.ReplyType)
 
-	err = service.call(ctx, mtype, reflect.ValueOf(argv), reflect.ValueOf(replyv))
+	if mtype.ArgType.Kind() != reflect.Ptr {
+		err = service.call(ctx, mtype, reflect.ValueOf(argv).Elem(), reflect.ValueOf(replyv))
+	} else {
+		err = service.call(ctx, mtype, reflect.ValueOf(argv), reflect.ValueOf(replyv))
+	}
 
 	argsReplyPools.Put(mtype.ArgType, argv)
 	if err != nil {

@@ -16,7 +16,7 @@ var (
 	processPkg    = flag.Bool("pkg", false, "process the whole package instead of just the given file")
 	specifiedName = flag.String("o", "", "specify the filename of the output")
 	buildTags     = flag.String("tags", "", "build tags to add to generated file")
-	registry      = flag.String("r", "etcd", "registry type. support etcd, consul, zookeeper, mdns")
+	registry      = flag.String("r", "", "registry type. support etcd, consul, zookeeper, mdns")
 )
 
 func main() {
@@ -48,6 +48,13 @@ func main() {
 			panic(err)
 		}
 
+		if !filepath.IsAbs(fname) {
+			fname, err = filepath.Abs(fname)
+			if err != nil {
+				panic(err)
+			}
+		}
+
 		relDir, err := filepath.Rel(filepath.Join(build.Default.GOPATH, "src"), fname)
 		if err != nil {
 			fmt.Printf("provided directory not under GOPATH (%s): %v",
@@ -55,7 +62,7 @@ func main() {
 			return
 		}
 
-		p := &parser.Parser{PkgFullName: relDir}
+		p := &parser.Parser{PkgFullName: relDir, StructNames: make(map[string]bool)}
 		if err := p.Parse(fname, fInfo.IsDir()); err != nil {
 			fmt.Printf("Error parsing %v: %v", fname, err)
 			return
@@ -92,7 +99,6 @@ func generate(parsers []*parser.Parser) error {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "import (")
 	fmt.Fprintln(w, `  "flag"`)
-	fmt.Fprintln(w, `  "log"`)
 	fmt.Fprintln(w, `  "time"`)
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, `  metrics "github.com/rcrowley/go-metrics"`)
@@ -119,9 +125,14 @@ var (
 
 	mainFn = mainFn + `
 	basePath = flag.String("base", "/rpcx", "prefix path")
+)
 	
 func main() {
 	flag.Parse()
+
+	_ = time.Second
+	_ = metrics.UseNilMetrics
+	_ = serverplugin.GetFunctionName
 
 	s := server.NewServer()
 	addRegistryPlugin(s)
@@ -134,12 +145,14 @@ func main() {
 
 	fmt.Fprintln(w, `func registerServices(s *server.Server) {`)
 	for _, p := range parsers {
-		for _, n := range p.StructNames {
+		for n := range p.StructNames {
 			fmt.Fprintln(w, `	s.Register(new(`+p.PkgName+"."+n+`), "")`)
 		}
 	}
 
 	fmt.Fprintln(w, `}`)
+
+	useRegistry := false
 
 	fmt.Fprintln(w, `func addRegistryPlugin(s *server.Server) {`)
 	switch *registry {
@@ -152,6 +165,7 @@ func main() {
 		Metrics:        metrics.NewRegistry(),
 		UpdateInterval: time.Minute,
 	}`)
+		useRegistry = true
 	case "consul":
 		fmt.Fprintln(w, `	// add registery
 	r := &serverplugin.ConsulRegisterPlugin{
@@ -161,6 +175,7 @@ func main() {
 		Metrics:        metrics.NewRegistry(),
 		UpdateInterval: time.Minute,
 	}`)
+		useRegistry = true
 	case "zookeeper":
 		fmt.Fprintln(w, `	// add registery
 	r := &serverplugin.ZooKeeperRegisterPlugin{
@@ -170,21 +185,25 @@ func main() {
 		Metrics:          metrics.NewRegistry(),
 		UpdateInterval:   time.Minute,
 	}`)
+		useRegistry = true
 	case "mdns":
 		fmt.Fprintln(w, `
 			r := serverplugin.NewMDNSRegisterPlugin("tcp@"+*addr, 8972, metrics.NewRegistry(), time.Minute, "")`)
+		useRegistry = true
 	default:
 		fmt.Fprintln(w, `
-		}`)
+		`)
 	}
 
-	fmt.Fprintln(w, `
+	if useRegistry {
+		fmt.Fprintln(w, `
 	err := r.Start()
 	if err != nil {
-		log.Fatal(err)
+		//log.Fatal(err)
 	}
-	s.Plugins.Add(r)
-}`)
+	s.Plugins.Add(r)`)
+	}
 
+	fmt.Fprintln(w, `}`)
 	return nil
 }

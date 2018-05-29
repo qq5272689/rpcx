@@ -73,6 +73,25 @@ func NewConsulDiscoveryStore(basePath string, kv store.Store) ServiceDiscovery {
 	return d
 }
 
+// NewConsulDiscoveryTemplate returns a new ConsulDiscovery template.
+func NewConsulDiscoveryTemplate(basePath string, consulAddr []string, options *store.Config) ServiceDiscovery {
+	if basePath[0] == '/' {
+		basePath = basePath[1:]
+	}
+
+	if len(basePath) > 1 && strings.HasSuffix(basePath, "/") {
+		basePath = basePath[:len(basePath)-1]
+	}
+
+	kv, err := libkv.NewStore(store.CONSUL, consulAddr, options)
+	if err != nil {
+		log.Infof("cannot create store: %v", err)
+		panic(err)
+	}
+
+	return &ConsulDiscovery{basePath: basePath, kv: kv}
+}
+
 // Clone clones this ServiceDiscovery with new servicePath.
 func (d ConsulDiscovery) Clone(servicePath string) ServiceDiscovery {
 	return NewConsulDiscoveryStore(d.basePath+"/"+servicePath, d.kv)
@@ -168,7 +187,7 @@ func (d *ConsulDiscovery) watch() {
 						select {
 						case ch <- pairs:
 						case <-time.After(time.Minute):
-							log.Warn("chan is full and new change has ben dropped")
+							log.Warn("chan is full and new change has been dropped")
 						}
 					}()
 				}
